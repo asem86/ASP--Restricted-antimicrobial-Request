@@ -31,8 +31,13 @@
   .card{ background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; }
   .field{ margin-bottom:14px; }
   .field label{ display:block; font-size:12.5px; font-weight:600; color:var(--neutral); margin-bottom:5px; }
+  .grid{ display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  @media (max-width:480px){ .grid{ grid-template-columns:1fr; } }
   input, select{ width:100%; padding:9px 10px; border:1px solid var(--line); border-radius:8px; font-size:14px; font-family:inherit; background:#fff; color:var(--ink); }
   input:focus, select:focus{ outline:2px solid var(--teal); outline-offset:-1px; }
+  input[readonly]{ background:var(--paper); color:var(--teal-dark); font-weight:600; }
+  .section-divider{ font-size:11.5px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; color:var(--teal); margin:18px 0 8px; padding-top:14px; border-top:1px solid var(--line); }
+  .section-divider:first-child{ margin-top:0; padding-top:0; border-top:none; }
   .btn-primary{ background:var(--teal); color:#fff; border:none; border-radius:8px; padding:11px 16px; font-size:14px; font-weight:600; cursor:pointer; font-family:inherit; width:100%; }
   .btn-primary:disabled{ opacity:.45; cursor:not-allowed; }
   .muted{ color:var(--neutral); }
@@ -86,7 +91,49 @@ const DEPARTMENTS = ["ICU", "CCU", "Medical ward", "Surgical ward", "Psychiatry 
 
 const GROUP_LABEL = { A: "Group A — ID approval only", B: "Group B — lifesaving, review after 48h", Other: "Other" };
 
+const BED_NUMBERS = Array.from({length:40}, (_,i)=>String(i+1));
+const THERAPY_BASIS = [
+  { id: "empirical", label: "Empirical" },
+  { id: "culture", label: "Culture-based" },
+];
+const SPECIMEN_SITES = [
+  "Blood", "Sputum", "Urine", "CSF", "Pleural fluid", "Synovial fluid",
+  "Ascitic fluid", "Wound/tissue culture", "Other body fluid",
+];
+const FREQUENCY_OPTIONS = [
+  { id: "stat", label: "STAT" },
+  { id: "q6h", label: "Every 6 hours" },
+  { id: "q8h", label: "Every 8 hours" },
+  { id: "q12h", label: "Every 12 hours" },
+  { id: "q24h", label: "Every 24 hours" },
+  { id: "q48h", label: "Every 48 hours" },
+  { id: "q72h", label: "Every 72 hours" },
+];
+const DURATION_OPTIONS = ["STAT", ...Array.from({length:14}, (_,i)=>String(i+1))];
+
+function calcCrCl(age, weightKg, sex, creatinineMgDl){
+  const a = Number(age), w = Number(weightKg), cr = Number(creatinineMgDl);
+  if (!a || !w || !cr) return null;
+  let crcl = ((140 - a) * w) / (72 * cr);
+  if (sex === "female") crcl *= 0.85;
+  return Math.round(crcl * 10) / 10;
+}
+
 const MY_REQUESTS_KEY = "amr_my_request_ids";
+const REQUESTER_PROFILE_KEY = "amr_requester_profile";
+function loadRequesterProfile(){
+  try { return JSON.parse(localStorage.getItem(REQUESTER_PROFILE_KEY) || "null"); } catch(e){ return null; }
+}
+function saveRequesterProfile(name, employeeId){
+  try { localStorage.setItem(REQUESTER_PROFILE_KEY, JSON.stringify({ name, employeeId })); } catch(e){}
+}
+function clearRequesterProfile(){
+  try { localStorage.removeItem(REQUESTER_PROFILE_KEY); } catch(e){}
+  savedProfile = null;
+  form.requesterName = ""; form.employeeId = "";
+  render();
+}
+window.clearRequesterProfile = clearRequesterProfile;
 
 function pad(n){ return String(n).padStart(2,"0"); }
 function nowLocalDateTime(){ const d=new Date(); return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`; }
@@ -109,14 +156,20 @@ function addMyRequestId(id){
 let tab = "new"; // "new" | "mine"
 let submitted = false;
 let myRequests = []; // live-synced docs for this device's submitted requests
+let savedProfile = loadRequesterProfile();
 let form = {
-  fileNumber: "", department: DEPARTMENTS[0],
+  fileNumber: "", patientName: "", department: DEPARTMENTS[0], bedNumber: "",
+  diagnosis: "", justification: "",
+  therapyBasis: "", organism: "", specimenSite: "",
   antibiotic: "", antibioticGroup: "", customAntibiotic: "",
-  requesterName: "", indication: "",
+  age: "", weight: "", sex: "", creatinine: "",
+  dose: "", frequency: "", duration: "",
+  notes: "", requesterName: savedProfile ? savedProfile.name : "", employeeId: savedProfile ? savedProfile.employeeId : "",
 };
 
 function resolvedAntibiotic(){ return form.antibiotic === "__other__" ? form.customAntibiotic.trim() : form.antibiotic; }
 function isFileNumberValid(v){ return /^[0-9]{7}$/.test(v || ""); }
+function isEmployeeIdValid(v){ return /^[0-9]{8}$/.test(v || ""); }
 
 /* Subscribe individually to each of this device's submitted request docs,
    so status updates (approved/rejected) show live without needing login. */
@@ -148,22 +201,47 @@ subscribeMine();
 /* ============================================================
    Actions
    ============================================================ */
-async function submitRequest(){
+function canSubmitRequest(){
   const abx = resolvedAntibiotic();
-  if (!abx || !isFileNumberValid(form.fileNumber) || !form.requesterName.trim() || !form.indication.trim()) return;
+  const validSpecimen = form.therapyBasis !== "culture" || !!form.specimenSite;
+  return !!(abx && isFileNumberValid(form.fileNumber) && form.requesterName.trim() && isEmployeeIdValid(form.employeeId)
+    && form.diagnosis.trim() && form.justification.trim() && form.dose.trim() && validSpecimen);
+}
+
+async function submitRequest(){
+  if (!canSubmitRequest()) return;
+  const abx = resolvedAntibiotic();
+  const crcl = calcCrCl(form.age, form.weight, form.sex, form.creatinine);
   const req = {
-    dateTime: nowLocalDateTime(), fileNumber: form.fileNumber, department: form.department,
+    dateTime: nowLocalDateTime(), fileNumber: form.fileNumber, patientName: form.patientName,
+    department: form.department, bedNumber: form.bedNumber,
+    diagnosis: form.diagnosis, justification: form.justification,
+    therapyBasis: form.therapyBasis, organism: form.therapyBasis === "culture" ? form.organism : "",
+    specimenSite: form.therapyBasis === "culture" ? form.specimenSite : "",
     antibiotic: abx, group: form.antibioticGroup || "Other",
-    requesterName: form.requesterName, indication: form.indication,
+    age: form.age || null, weight: form.weight || null, sex: form.sex || "",
+    creatinine: form.creatinine || null, crcl: crcl,
+    dose: form.dose, frequency: form.frequency, duration: form.duration,
+    notes: form.notes, requesterName: form.requesterName, employeeId: form.employeeId,
     status: "pending", createdAt: Date.now(),
   };
   if (!requestsRef) { alert("This form isn't connected yet — please contact the ID department."); return; }
   try {
     const ref = await requestsRef.add(req);
     addMyRequestId(ref.id);
+    saveRequesterProfile(form.requesterName, form.employeeId);
+    savedProfile = { name: form.requesterName, employeeId: form.employeeId };
     subscribeMine();
     submitted = true;
-    form = { fileNumber: "", department: DEPARTMENTS[0], antibiotic: "", antibioticGroup: "", customAntibiotic: "", requesterName: form.requesterName, indication: "" };
+    form = {
+      fileNumber: "", patientName: "", department: DEPARTMENTS[0], bedNumber: "",
+      diagnosis: "", justification: "",
+      therapyBasis: "", organism: "", specimenSite: "",
+      antibiotic: "", antibioticGroup: "", customAntibiotic: "",
+      age: "", weight: "", sex: "", creatinine: "",
+      dose: "", frequency: "", duration: "",
+      notes: "", requesterName: form.requesterName, employeeId: form.employeeId,
+    };
     render();
   } catch(e){
     alert("Could not submit: " + e.message);
@@ -225,21 +303,70 @@ function render(){
 }
 
 function renderNewRequest(){
-  const abx = resolvedAntibiotic();
-  const canSubmit = abx && isFileNumberValid(form.fileNumber) && form.requesterName.trim() && form.indication.trim();
+  const canSubmit = canSubmitRequest();
+  const crcl = calcCrCl(form.age, form.weight, form.sex, form.creatinine);
   return `
     ${submitted ? `<div class="confirm-banner">Request submitted. The ID team will review it shortly — check the "My requests" tab for the status.</div>` : ""}
     <div class="card">
-      <div class="field">
-        <label>File number (required, exactly 7 digits)</label>
-        <input id="f-fileNumber" inputmode="numeric" value="${esc(form.fileNumber)}" placeholder="e.g. 1234567" maxlength="7" oninput="updateForm('fileNumber', this.value.replace(/[^0-9]/g,'').slice(0,7))" />
+      <div class="section-divider">Patient</div>
+      <div class="grid">
+        <div class="field">
+          <label>File number (required, exactly 7 digits)</label>
+          <input id="f-fileNumber" inputmode="numeric" value="${esc(form.fileNumber)}" placeholder="e.g. 1234567" maxlength="7" oninput="updateForm('fileNumber', this.value.replace(/[^0-9]/g,'').slice(0,7))" />
+        </div>
+        <div class="field">
+          <label>Patient name</label>
+          <input id="f-patientName" value="${esc(form.patientName)}" placeholder="Patient's name" oninput="updateForm('patientName', this.value)" />
+        </div>
+      </div>
+      <div class="grid">
+        <div class="field">
+          <label>Department</label>
+          <select onchange="updateForm('department', this.value)">
+            ${DEPARTMENTS.map(d => `<option value="${d}" ${form.department===d?'selected':''}>${d}</option>`).join("")}
+          </select>
+        </div>
+        <div class="field">
+          <label>Bed number</label>
+          <select onchange="updateForm('bedNumber', this.value)">
+            <option value="" ${!form.bedNumber?'selected':''}>Select bed...</option>
+            ${BED_NUMBERS.map(b => `<option value="${b}" ${form.bedNumber===b?'selected':''}>${b}</option>`).join("")}
+          </select>
+        </div>
       </div>
       <div class="field">
-        <label>Department</label>
-        <select onchange="updateForm('department', this.value)">
-          ${DEPARTMENTS.map(d => `<option value="${d}" ${form.department===d?'selected':''}>${d}</option>`).join("")}
+        <label>Diagnosis (required)</label>
+        <input id="f-diagnosis" value="${esc(form.diagnosis)}" placeholder="e.g. VAP, febrile neutropenia" oninput="updateForm('diagnosis', this.value)" />
+      </div>
+      <div class="field">
+        <label>Justification for this restricted antibiotic (required)</label>
+        <input id="f-justification" value="${esc(form.justification)}" placeholder="Why this agent is needed" oninput="updateForm('justification', this.value)" />
+      </div>
+
+      <div class="section-divider">Therapy basis</div>
+      <div class="field">
+        <label>Empirical or culture-based</label>
+        <select onchange="updateForm('therapyBasis', this.value)">
+          <option value="" ${!form.therapyBasis?'selected':''}>Select basis...</option>
+          ${THERAPY_BASIS.map(b => `<option value="${b.id}" ${form.therapyBasis===b.id?'selected':''}>${b.label}</option>`).join("")}
         </select>
       </div>
+      ${form.therapyBasis === "culture" ? `
+      <div class="grid">
+        <div class="field">
+          <label>Culture specimen site (required)</label>
+          <select onchange="updateForm('specimenSite', this.value)">
+            <option value="" ${!form.specimenSite?'selected':''}>Select specimen site...</option>
+            ${SPECIMEN_SITES.map(s => `<option value="${esc(s)}" ${form.specimenSite===s?'selected':''}>${esc(s)}</option>`).join("")}
+          </select>
+        </div>
+        <div class="field">
+          <label>Organism / microbe (optional — leave blank if pending)</label>
+          <input id="f-organism" value="${esc(form.organism)}" placeholder="e.g. MRSA, E. coli" oninput="updateForm('organism', this.value)" />
+        </div>
+      </div>` : ""}
+
+      <div class="section-divider">Antibiotic</div>
       <div class="field">
         <label>Antibiotic requested</label>
         <select onchange="pickAntibiotic(this.value)">
@@ -254,14 +381,78 @@ function renderNewRequest(){
         </select>
         ${form.antibiotic === "__other__" ? `<input id="f-customAntibiotic" style="margin-top:6px;" value="${esc(form.customAntibiotic)}" placeholder="Type antibiotic name" oninput="updateForm('customAntibiotic', this.value)" />` : ""}
       </div>
-      <div class="field">
-        <label>Your name (required)</label>
-        <input id="f-requesterName" value="${esc(form.requesterName)}" placeholder="e.g. Dr. Sara, Bed 4 nurse" oninput="updateForm('requesterName', this.value)" />
+
+      <div class="section-divider">Dosing (optional — helps calculate creatinine clearance)</div>
+      <div class="grid">
+        <div class="field">
+          <label>Age (years)</label>
+          <input id="f-age" type="number" min="0" max="120" value="${esc(form.age)}" oninput="updateForm('age', this.value)" />
+        </div>
+        <div class="field">
+          <label>Weight (kg)</label>
+          <input id="f-weight" type="number" min="0" step="0.1" value="${esc(form.weight)}" oninput="updateForm('weight', this.value)" />
+        </div>
+      </div>
+      <div class="grid">
+        <div class="field">
+          <label>Sex</label>
+          <select onchange="updateForm('sex', this.value)">
+            <option value="" ${!form.sex?'selected':''}>Select...</option>
+            <option value="male" ${form.sex==='male'?'selected':''}>Male</option>
+            <option value="female" ${form.sex==='female'?'selected':''}>Female</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Serum creatinine (mg/dL)</label>
+          <input id="f-creatinine" type="number" min="0" step="0.01" value="${esc(form.creatinine)}" oninput="updateForm('creatinine', this.value)" />
+        </div>
       </div>
       <div class="field">
-        <label>Indication / diagnosis (required)</label>
-        <input id="f-indication" value="${esc(form.indication)}" placeholder="e.g. VAP, febrile neutropenia" oninput="updateForm('indication', this.value)" />
+        <label>Creatinine clearance (auto-calculated, Cockcroft-Gault)</label>
+        <input value="${crcl!=null ? crcl + ' mL/min' : ''}" placeholder="Fill age, weight, sex &amp; creatinine above" readonly />
       </div>
+      <div class="field">
+        <label>Dose (required)</label>
+        <input id="f-dose" value="${esc(form.dose)}" placeholder="e.g. 1 g IV" oninput="updateForm('dose', this.value)" />
+      </div>
+      <div class="grid">
+        <div class="field">
+          <label>Frequency</label>
+          <select onchange="updateForm('frequency', this.value)">
+            <option value="" ${!form.frequency?'selected':''}>Select frequency...</option>
+            ${FREQUENCY_OPTIONS.map(f => `<option value="${f.id}" ${form.frequency===f.id?'selected':''}>${f.label}</option>`).join("")}
+          </select>
+        </div>
+        <div class="field">
+          <label>Duration</label>
+          <select onchange="updateForm('duration', this.value)">
+            <option value="" ${!form.duration?'selected':''}>Select duration...</option>
+            ${DURATION_OPTIONS.map(v => `<option value="${v}" ${form.duration===v?'selected':''}>${v === "STAT" ? "STAT" : v + (v==="1"?" day":" days")}</option>`).join("")}
+          </select>
+        </div>
+      </div>
+      <div class="field">
+        <label>Notes (optional)</label>
+        <input id="f-notes" value="${esc(form.notes)}" oninput="updateForm('notes', this.value)" />
+      </div>
+
+      <div class="section-divider">Requested by</div>
+      ${savedProfile && form.requesterName === savedProfile.name && form.employeeId === savedProfile.employeeId ? `
+      <div style="font-size:12.5px; color:var(--neutral); margin-bottom:8px;">
+        Remembered as <strong style="color:var(--teal-dark);">${esc(form.requesterName)}</strong> (ID ${esc(form.employeeId)}) on this device.
+        <a href="#" onclick="clearRequesterProfile(); return false;" style="color:var(--teal); margin-left:4px;">Not you?</a>
+      </div>` : `
+      <div class="grid">
+        <div class="field">
+          <label>Your name (required)</label>
+          <input id="f-requesterName" value="${esc(form.requesterName)}" placeholder="e.g. Dr. Sara" oninput="updateForm('requesterName', this.value)" />
+        </div>
+        <div class="field">
+          <label>Employee ID (required, 8 digits)</label>
+          <input id="f-employeeId" inputmode="numeric" value="${esc(form.employeeId)}" placeholder="e.g. 12345678" maxlength="8" oninput="updateForm('employeeId', this.value.replace(/[^0-9]/g,'').slice(0,8))" />
+        </div>
+      </div>
+      <p class="muted" style="font-size:11.5px; margin-top:-6px; margin-bottom:14px;">Saved on this device after your first request, so you won't need to type it again.</p>`}
       <button class="btn-primary" ${canSubmit?'':'disabled'} onclick="submitRequest()">Submit request</button>
     </div>
   `;
@@ -274,11 +465,14 @@ function renderMyRequests(){
   return myRequests.map(r => {
     const statusColor = r.status === "approve" ? "var(--approve)" : r.status === "reject" ? "var(--reject)" : "var(--escalate)";
     const statusLabel = r.status === "approve" ? "Approved" : r.status === "reject" ? "Rejected" : "Pending";
+    const doseLine = [r.dose, r.frequency ? (FREQUENCY_OPTIONS.find(f=>f.id===r.frequency)||{}).label : "", r.duration ? (r.duration==="STAT"?"STAT":r.duration+" days") : ""].filter(Boolean).join(" · ");
     return `<div class="req-card">
       <div class="req-top">
         <div>
-          <div style="font-weight:600; font-size:14.5px;">${esc(r.antibiotic||"")} <span class="muted" style="font-weight:400; font-size:12.5px;">— File ${esc(r.fileNumber||"")}, ${esc(r.department||"")}</span></div>
-          <div class="muted" style="font-size:12.5px; margin-top:2px;">${esc(r.indication||"")}</div>
+          <div style="font-weight:600; font-size:14.5px;">${esc(r.antibiotic||"")} <span class="muted" style="font-weight:400; font-size:12.5px;">— File ${esc(r.fileNumber||"")}${r.bedNumber?', Bed '+esc(r.bedNumber):''}, ${esc(r.department||"")}</span></div>
+          ${r.patientName ? `<div class="muted" style="font-size:12.5px; margin-top:2px;">${esc(r.patientName)}</div>` : ""}
+          <div class="muted" style="font-size:12.5px; margin-top:2px;">${esc(r.diagnosis||"")}</div>
+          ${doseLine ? `<div class="muted" style="font-size:12.5px; margin-top:2px;">${esc(doseLine)}</div>` : ""}
           <div class="muted" style="font-size:12px; margin-top:2px;">Submitted ${dateOnly(r.dateTime)} ${timeOnly(r.dateTime)}</div>
         </div>
         <span class="status-pill" style="background:${statusColor}; color:#fff;">${statusLabel}</span>
